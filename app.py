@@ -27,6 +27,10 @@ class Handler(BaseHTTPRequestHandler):
                 uid=int(parse_qs(p.query).get("user_id",[0])[0]); return self._json(200,self.db.get_snapshot(int(parts[2]),int(parts[4]),uid))
             if len(parts)==4 and parts[:2]==["api","works"] and parts[3]=="collation":
                 uid=int(parse_qs(p.query).get("user_id",[0])[0]); return self._json(200,self.db.export_collation(int(parts[2]),uid))
+            if len(parts)==4 and parts[:2]==["api","works"] and parts[3]=="releases":
+                uid=int(parse_qs(p.query).get("user_id",[0])[0]); return self._json(200,self.db.list_releases(int(parts[2]),uid))
+            if len(parts)==3 and parts[:2]==["api","releases"]:
+                uid=int(parse_qs(p.query).get("user_id",[0])[0]); return self._json(200,self.db.get_release(int(parts[2]),uid))
             self._json(404,{"ok":False,"error":"接口不存在"})
         except (DomainError,ValueError) as exc: self._json(400,{"ok":False,"error":str(exc)})
     def do_POST(self):
@@ -44,6 +48,17 @@ class Handler(BaseHTTPRequestHandler):
             if len(parts)==4 and parts[:2]==["api","variants"] and parts[3]=="revisions": return self._json(200,{"ok":True,"revision":self.db.update_variant(int(parts[2]),str(b.get("proposed_text","")),str(b.get("reason","")),int(b.get("user_id",0)),int(b.get("expected_revision",0)))})
             if path=="/api/notes": return self._json(201,{"ok":True,"id":self.db.add_note(int(b.get("variant_id",0)),str(b.get("body","")),int(b.get("user_id",0)))})
             if len(parts)==4 and parts[:2]==["api","passages"] and parts[3]=="lock": self.db.lock_passage(int(parts[2]),int(b.get("user_id",0)),str(b.get("reason",""))); return self._json(200,{"ok":True})
+            if len(parts)==4 and parts[:2]==["api","passages"] and parts[3]=="unlock": self.db.unlock_passage(int(parts[2]),int(b.get("user_id",0))); return self._json(200,{"ok":True})
+            if len(parts)==4 and parts[:2]==["api","works"] and parts[3]=="transfer": self.db.transfer_work(int(parts[2]),int(b.get("new_owner_id",0)),int(b.get("user_id",0))); return self._json(200,{"ok":True})
+            if len(parts)==5 and parts[:2]==["api","witnesses"] and parts[3:]==["editors","revoke"]: self.db.revoke_witness_editor(int(parts[2]),int(b.get("user_id",0)),int(b.get("granted_by",0))); return self._json(200,{"ok":True})
+            if len(parts)==4 and parts[:2]==["api","works"] and parts[3]=="releases":
+                return self._json(201,{"ok":True,"id":self.db.create_release(int(parts[2]),int(b.get("cutoff_revision",-1)),int(b.get("user_id",0)))})
+            if path=="/api/releases/items":
+                return self._json(200,{"ok":True,"result":self.db.submit_release_item(int(b.get("release_id",0)),int(b.get("passage_id",0)),int(b.get("user_id",0)),bool(b.get("confirm",False)))})
+            if len(parts)==5 and parts[:2]==["api","releases"] and parts[3:]==["items","retry"]:
+                return self._json(200,{"ok":True,"result":self.db.retry_failed_items(int(parts[2]),int(b.get("user_id",0)))})
+            if len(parts)==4 and parts[:2]==["api","releases"] and parts[3]=="publish":
+                return self._json(200,{"ok":True,"result":self.db.publish_release(int(parts[2]),int(b.get("user_id",0)))})
             self._json(404,{"ok":False,"error":"接口不存在"})
         except (DomainError,ValueError) as exc: self._json(400,{"ok":False,"error":str(exc)})
 def main():

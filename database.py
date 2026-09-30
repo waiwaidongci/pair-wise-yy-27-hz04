@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import threading
 from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
@@ -31,6 +32,9 @@ class CollationDB:
     def __init__(self, path: str = "collation.db") -> None:
         self.conn = sqlite3.connect(path, check_same_thread=False)
         self.conn.row_factory = sqlite3.Row
+        # 单连接配合线程锁：BEGIN IMMEDIATE 之外再串行化进程内的写事务，
+        # 保证两名编辑并发提交同一段落时严格先到者写入
+        self._xlock = threading.RLock()
         self.conn.execute("PRAGMA foreign_keys=ON")
         if path != ":memory:":
             self.conn.execute("PRAGMA journal_mode=WAL")
@@ -41,13 +45,14 @@ class CollationDB:
 
     @contextmanager
     def transaction(self):
-        try:
-            self.conn.execute("BEGIN IMMEDIATE")
-            yield
-            self.conn.commit()
-        except Exception:
-            self.conn.rollback()
-            raise
+        with self._xlock:
+            try:
+                self.conn.execute("BEGIN IMMEDIATE")
+                yield
+                self.conn.commit()
+            except Exception:
+                self.conn.rollback()
+                raise
 
     def _schema(self) -> None:
         self.conn.executescript(
@@ -143,6 +148,34 @@ class CollationDB:
               locked_by INTEGER NOT NULL REFERENCES users(id),
               reason TEXT NOT NULL DEFAULT '',
               locked_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS releases (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              work_id INTEGER NOT NULL REFERENCES works(id),
+              seq INTEGER NOT NULL,
+              cutoff_revision INTEGER NOT NULL,
+              status TEXT NOT NULL DEFAULT 'candidate' CHECK(status IN ('candidate','published','void')),
+              created_by INTEGER NOT NULL REFERENCES users(id),
+              created_at TEXT NOT NULL,
+              published_at TEXT,
+              voided_at TEXT,
+              void_reason TEXT NOT NULL DEFAULT '',
+              manifest_json TEXT NOT NULL DEFAULT '',
+              UNIQUE(work_id,seq)
+            );
+            CREATE TABLE IF NOT EXISTS release_items (
+              release_id INTEGER NOT NULL REFERENCES releases(id),
+              passage_id INTEGER NOT NULL REFERENCES passages(id),
+              position INTEGER NOT NULL,
+              status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending','done','failed')),
+              attempts INTEGER NOT NULL DEFAULT 0,
+              revision_no INTEGER NOT NULL DEFAULT 0,
+              content_json TEXT NOT NULL DEFAULT '',
+              error TEXT NOT NULL DEFAULT '',
+              submitted_by INTEGER REFERENCES users(id),
+              reconfirmed_by INTEGER REFERENCES users(id),
+              updated_at TEXT NOT NULL,
+              PRIMARY KEY(release_id,passage_id)
             );
             """
         )
@@ -372,12 +405,46 @@ class CollationDB:
         if not passage:
             raise DomainError("段落不存在")
         self._require_owner(passage["work_id"], user_id)
+        if passage["status"] == "locked":
+            raise DomainError("段落已处于锁定状态")
         with self.transaction():
             self.conn.execute("UPDATE passages SET status='locked',updated_by=?,updated_at=? WHERE id=?", (user_id, datetime.now().isoformat(), passage_id))
             self.conn.execute(
                 "INSERT OR REPLACE INTO passage_locks(passage_id,locked_by,reason,locked_at) VALUES(?,?,?,?)",
                 (passage_id, user_id, reason.strip(), datetime.now().isoformat()),
             )
+        self._void_candidates(passage["work_id"], "段落锁定状态发生变化")
+
+    def unlock_passage(self, passage_id: int, user_id: int) -> None:
+        passage = self.conn.execute("SELECT * FROM passages WHERE id=?", (passage_id,)).fetchone()
+        if not passage:
+            raise DomainError("段落不存在")
+        self._require_owner(passage["work_id"], user_id)
+        if passage["status"] != "locked":
+            raise DomainError("段落未处于锁定状态")
+        with self.transaction():
+            self.conn.execute("UPDATE passages SET status='open',updated_by=?,updated_at=? WHERE id=?", (user_id, datetime.now().isoformat(), passage_id))
+            self.conn.execute("DELETE FROM passage_locks WHERE passage_id=?", (passage_id,))
+        self._void_candidates(passage["work_id"], "段落锁定状态发生变化")
+
+    def transfer_work(self, work_id: int, new_owner_id: int, user_id: int) -> None:
+        self._require_owner(work_id, user_id)
+        new_owner = self.conn.execute("SELECT 1 FROM users WHERE id=? AND role='owner'", (new_owner_id,)).fetchone()
+        if not new_owner:
+            raise DomainError("新负责人不存在或不是负责人角色")
+        with self.transaction():
+            self.conn.execute("UPDATE works SET owner_id=? WHERE id=?", (new_owner_id, work_id))
+        self._void_candidates(work_id, "项目负责人已更换")
+
+    def revoke_witness_editor(self, witness_id: int, user_id: int, granted_by: int) -> None:
+        witness = self.conn.execute("SELECT work_id FROM witnesses WHERE id=?", (witness_id,)).fetchone()
+        if not witness:
+            raise DomainError("版本不存在")
+        self._require_owner(witness["work_id"], granted_by)
+        with self.transaction():
+            cur = self.conn.execute("DELETE FROM witness_editors WHERE witness_id=? AND user_id=?", (witness_id, user_id))
+        if cur.rowcount:
+            self._void_candidates(witness["work_id"], "版本编辑授权已撤回")
 
     def get_snapshot(self, passage_id: int, revision_no: int, user_id: int) -> dict:
         passage = self.conn.execute("SELECT work_id FROM passages WHERE id=?", (passage_id,)).fetchone()
@@ -421,3 +488,269 @@ class CollationDB:
             "witnesses": [dict(r) for r in self.conn.execute("SELECT * FROM witnesses ORDER BY id")],
             "passages": [dict(r) for r in self.conn.execute("SELECT * FROM passages ORDER BY id")],
         }
+
+    # ------------------------------------------------------------------
+    # 可恢复的合校发布
+    # ------------------------------------------------------------------
+
+    def _void_candidates(self, work_id: int, reason: str) -> None:
+        with self.transaction():
+            self.conn.execute(
+                "UPDATE releases SET status='void',voided_at=?,void_reason=? WHERE work_id=? AND status='candidate'",
+                (datetime.now().isoformat(), reason, work_id),
+            )
+
+    def create_release(self, work_id: int, cutoff_revision: int, user_id: int) -> int:
+        self._require_owner(work_id, user_id)
+        work = self.conn.execute("SELECT * FROM works WHERE id=?", (work_id,)).fetchone()
+        if not work:
+            raise DomainError("作品不存在")
+        if not isinstance(cutoff_revision, int) or cutoff_revision < 0:
+            raise DomainError("截止修订号必须是不小于0的整数")
+        max_rev = int(self.conn.execute(
+            "SELECT COALESCE(MAX(revision_no),0) FROM revisions r JOIN passages p ON p.id=r.passage_id WHERE p.work_id=?",
+            (work_id,),
+        ).fetchone()[0])
+        if cutoff_revision > max_rev:
+            raise DomainError(f"截止修订号不能超过当前最大修订号 {max_rev}")
+        with self.transaction():
+            active = self.conn.execute("SELECT 1 FROM releases WHERE work_id=? AND status='candidate'", (work_id,)).fetchone()
+            if active:
+                raise DomainError("该作品已有未发布的候选稿，请先发布或作废")
+            seq = int(self.conn.execute("SELECT COALESCE(MAX(seq),0)+1 FROM releases WHERE work_id=?", (work_id,)).fetchone()[0])
+            now = datetime.now().isoformat()
+            cur = self.conn.execute(
+                "INSERT INTO releases(work_id,seq,cutoff_revision,created_by,created_at) VALUES(?,?,?,?,?)",
+                (work_id, seq, cutoff_revision, user_id, now),
+            )
+            release_id = int(cur.lastrowid)
+            rows = self.conn.execute("SELECT id FROM passages WHERE work_id=? ORDER BY id", (work_id,)).fetchall()
+            if not rows:
+                raise DomainError("作品还没有段落，无法生成合校稿")
+            for position, row in enumerate(rows, 1):
+                self.conn.execute(
+                    "INSERT INTO release_items(release_id,passage_id,position,updated_at) VALUES(?,?,?,?)",
+                    (release_id, row["id"], position, now),
+                )
+        return release_id
+
+    def _release_row(self, release_id: int):
+        release = self.conn.execute("SELECT * FROM releases WHERE id=?", (release_id,)).fetchone()
+        if not release:
+            raise DomainError("合校稿不存在")
+        return release
+
+    def _can_contribute(self, work_id: int, user_id: int) -> bool:
+        if self.conn.execute("SELECT 1 FROM works WHERE id=? AND owner_id=?", (work_id, user_id)).fetchone():
+            return True
+        return bool(self.conn.execute(
+            "SELECT 1 FROM witnesses w JOIN witness_editors e ON e.witness_id=w.id WHERE w.work_id=? AND e.user_id=? LIMIT 1",
+            (work_id, user_id),
+        ).fetchone())
+
+    def _assemble_item(self, passage_id: int, cutoff_revision: int) -> dict:
+        """按截止修订号重建一个段落的合校片段；无对齐或缺口标记非法时失败。
+
+        异文旧层在活表中会被覆盖，因此截止点的异文状态从各修订快照中
+        按 variant 取截止前最近一条；注释为追加型数据，直接取活表。
+        """
+        passage = self.conn.execute("SELECT * FROM passages WHERE id=?", (passage_id,)).fetchone()
+        if not passage:
+            raise DomainError("段落不存在")
+        chosen = self.conn.execute(
+            "SELECT * FROM revisions WHERE passage_id=? AND revision_no<=? ORDER BY revision_no DESC LIMIT 1",
+            (passage_id, cutoff_revision),
+        ).fetchone()
+        revision_no = chosen["revision_no"] if chosen else 0
+        if chosen:
+            snapshot = json.loads(chosen["snapshot_json"])
+            base_text = snapshot["passage"]["base_text"]
+            alignments = snapshot["alignments"]
+        else:
+            base_text = passage["base_text"]
+            alignments = [dict(r) for r in self.conn.execute(
+                "SELECT a.*,w.siglum,w.kind FROM alignments a JOIN witnesses w ON w.id=a.witness_id "
+                "WHERE a.passage_id=? ORDER BY a.sort_order", (passage_id,)
+            ).fetchall()]
+        if not alignments:
+            raise DomainError("该段落尚无任何版本对齐，无法合校")
+        align_out, gaps = [], 0
+        for a in alignments:
+            text = a["aligned_text"]
+            has_gap = ("[缺页]" in text or "[残损]" in text)
+            if has_gap:
+                gaps += 1
+            align_out.append({
+                "witness_id": a["witness_id"], "siglum": a["siglum"], "kind": a["kind"],
+                "aligned_text": text, "sort_order": a["sort_order"], "has_gap": has_gap,
+            })
+        # 截止点异文：每个 variant 取截止前最近一次快照状态
+        variant_states: dict = {}
+        if chosen:
+            for rev in self.conn.execute(
+                "SELECT variant_id,snapshot_json FROM revisions WHERE passage_id=? AND revision_no<=? "
+                "AND variant_id IS NOT NULL ORDER BY revision_no",
+                (passage_id, cutoff_revision),
+            ).fetchall():
+                snap = json.loads(rev["snapshot_json"])
+                if snap.get("variant"):
+                    variant_states[rev["variant_id"]] = snap["variant"]
+        else:
+            for v in self.conn.execute("SELECT * FROM variants WHERE passage_id=?", (passage_id,)).fetchall():
+                variant_states[v["id"]] = dict(v)
+        variants = []
+        for v in sorted(variant_states.values(), key=lambda x: (x["witness_id"], x["layer"], x["id"])):
+            variant = {k: v[k] for k in ("id", "witness_id", "base_text", "proposed_text", "reason", "layer")}
+            variant["notes"] = [
+                {"id": n["id"], "body": n["body"], "author_id": n["author_id"], "created_at": n["created_at"]}
+                for n in self.conn.execute("SELECT * FROM notes WHERE variant_id=? ORDER BY id", (v["id"],)).fetchall()
+            ]
+            variants.append(variant)
+        return {
+            "passage_id": passage_id,
+            "label": passage["label"],
+            "base_text": base_text,
+            "revision_no": revision_no,
+            "alignments": align_out,
+            "variants": variants,
+            "gap_count": gaps,
+        }
+
+    def submit_release_item(self, release_id: int, passage_id: int, user_id: int, confirm: bool = False) -> dict:
+        release = self._release_row(release_id)
+        if release["status"] == "void":
+            raise DomainError("候选稿已作废，请重新发起合校")
+        if release["status"] == "published":
+            raise DomainError("合校稿已发布，段落内容不可更改")
+        if not self._can_contribute(release["work_id"], user_id):
+            raise DomainError("无权提交合校段落（需要负责人或版本编辑身份）")
+        with self.transaction():
+            item = self.conn.execute(
+                "SELECT * FROM release_items WHERE release_id=? AND passage_id=?", (release_id, passage_id)
+            ).fetchone()
+            if not item:
+                raise DomainError("该段落不属于此合校稿")
+            if item["status"] == "done":
+                if not confirm:
+                    raise DomainError(
+                        f"该段落已由编辑 {item['submitted_by']} 先完成；如确认沿用其结果，请重新提交并携带 confirm=true"
+                    )
+                self.conn.execute(
+                    "UPDATE release_items SET reconfirmed_by=?,updated_at=? WHERE release_id=? AND passage_id=?",
+                    (user_id, datetime.now().isoformat(), release_id, passage_id),
+                )
+                return {"release_id": release_id, "passage_id": passage_id,
+                        "status": "done", "reconfirmed": True,
+                        "submitted_by": item["submitted_by"]}
+            # pending / failed 都允许尝试；done 不会走到这里，因此已完成段落绝不重做
+            cur = self.conn.execute(
+                "UPDATE release_items SET attempts=attempts+1,updated_at=? "
+                "WHERE release_id=? AND passage_id=? AND status!='done'",
+                (datetime.now().isoformat(), release_id, passage_id),
+            )
+            if cur.rowcount == 0:
+                raise DomainError("该段落刚被其他编辑完成，请重新确认")
+            try:
+                content = self._assemble_item(passage_id, int(release["cutoff_revision"]))
+            except DomainError as exc:
+                self.conn.execute(
+                    "UPDATE release_items SET status='failed',error=?,submitted_by=?,updated_at=? "
+                    "WHERE release_id=? AND passage_id=?",
+                    (str(exc), user_id, datetime.now().isoformat(), release_id, passage_id),
+                )
+                return {"release_id": release_id, "passage_id": passage_id,
+                        "status": "failed", "error": str(exc), "attempts": item["attempts"] + 1}
+            self.conn.execute(
+                "UPDATE release_items SET status='done',revision_no=?,content_json=?,error='',"
+                "submitted_by=?,reconfirmed_by=NULL,updated_at=? WHERE release_id=? AND passage_id=?",
+                (content["revision_no"], json.dumps(content, ensure_ascii=False), user_id,
+                 datetime.now().isoformat(), release_id, passage_id),
+            )
+        return {"release_id": release_id, "passage_id": passage_id, "status": "done"}
+
+    def retry_failed_items(self, release_id: int, user_id: int) -> dict:
+        release = self._release_row(release_id)
+        if release["status"] != "candidate":
+            raise DomainError("只有候选稿可以重试失败段落")
+        if not self._can_contribute(release["work_id"], user_id):
+            raise DomainError("无权提交合校段落")
+        results = []
+        failed = self.conn.execute(
+            "SELECT passage_id FROM release_items WHERE release_id=? AND status='failed' ORDER BY position",
+            (release_id,),
+        ).fetchall()
+        for row in failed:
+            results.append(self.submit_release_item(release_id, row["passage_id"], user_id))
+        return {"release_id": release_id, "retried": results}
+
+    def publish_release(self, release_id: int, user_id: int) -> dict:
+        release = self._release_row(release_id)
+        self._require_owner(release["work_id"], user_id)
+        if release["status"] == "void":
+            raise DomainError("候选稿已作废，不能发布")
+        if release["status"] == "published":
+            raise DomainError("合校稿已发布")
+        with self.transaction():
+            pending = self.conn.execute(
+                "SELECT COUNT(*) FROM release_items WHERE release_id=? AND status!='done'", (release_id,)
+            ).fetchone()[0]
+            if pending:
+                raise DomainError(f"还有 {pending} 个段落未完成（含失败），不能发布")
+            manifest = self._build_manifest(release_id)
+            now = datetime.now().isoformat()
+            self.conn.execute(
+                "UPDATE releases SET status='published',published_at=?,manifest_json=? WHERE id=?",
+                (now, json.dumps(manifest, ensure_ascii=False), release_id),
+            )
+        return {"release_id": release_id, "status": "published", "published_at": now}
+
+    def _build_manifest(self, release_id: int) -> dict:
+        release = self._release_row(release_id)
+        work = dict(self.conn.execute("SELECT * FROM works WHERE id=?", (release["work_id"],)).fetchone())
+        witnesses = [dict(r) for r in self.conn.execute(
+            "SELECT * FROM witnesses WHERE work_id=? ORDER BY id", (release["work_id"],))]
+        items, gaps = [], 0
+        for row in self.conn.execute(
+            "SELECT * FROM release_items WHERE release_id=? ORDER BY position", (release_id,)
+        ).fetchall():
+            content = json.loads(row["content_json"])
+            gaps += content.get("gap_count", 0)
+            items.append(content)
+        return {"cutoff_revision": release["cutoff_revision"], "work": work,
+                "witnesses": witnesses, "passages": items, "gap_count": gaps}
+
+    def get_release(self, release_id: int, user_id: int) -> dict:
+        release = self._release_row(release_id)
+        if not self.can_view_work(release["work_id"], user_id):
+            raise DomainError("无权查看该合校稿")
+        items = []
+        for row in self.conn.execute(
+            "SELECT passage_id,position,status,attempts,revision_no,error,submitted_by,reconfirmed_by,updated_at "
+            "FROM release_items WHERE release_id=? ORDER BY position", (release_id,)
+        ).fetchall():
+            item = dict(row)
+            if row["status"] == "done":
+                item["content"] = json.loads(
+                    self.conn.execute("SELECT content_json FROM release_items WHERE release_id=? AND passage_id=?",
+                                      (release_id, row["passage_id"])).fetchone()["content_json"]
+                )
+            items.append(item)
+        result = {k: release[k] for k in ("id", "work_id", "seq", "cutoff_revision", "status",
+                                          "created_by", "created_at", "published_at", "voided_at", "void_reason")}
+        result["items"] = items
+        counts = {"pending": 0, "done": 0, "failed": 0}
+        for item in items:
+            counts[item["status"]] += 1
+        result["counts"] = counts
+        if release["status"] == "published":
+            result["manifest"] = json.loads(release["manifest_json"])
+        return result
+
+    def list_releases(self, work_id: int, user_id: int) -> dict:
+        if not self.can_view_work(work_id, user_id):
+            raise DomainError("无权查看该合校项目")
+        rows = self.conn.execute(
+            "SELECT id,seq,cutoff_revision,status,created_at,published_at,void_reason FROM releases "
+            "WHERE work_id=? ORDER BY seq", (work_id,)
+        ).fetchall()
+        return {"work_id": work_id, "releases": [dict(r) for r in rows]}
