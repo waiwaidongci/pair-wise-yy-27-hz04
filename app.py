@@ -27,6 +27,10 @@ class Handler(BaseHTTPRequestHandler):
                 uid=int(parse_qs(p.query).get("user_id",[0])[0]); return self._json(200,self.db.get_snapshot(int(parts[2]),int(parts[4]),uid))
             if len(parts)==4 and parts[:2]==["api","works"] and parts[3]=="collation":
                 uid=int(parse_qs(p.query).get("user_id",[0])[0]); return self._json(200,self.db.export_collation(int(parts[2]),uid))
+            if len(parts)==4 and parts[:2]==["api","works"] and parts[3]=="collation-drafts":
+                uid=int(parse_qs(p.query).get("user_id",[0])[0]); return self._json(200,{"ok":True,"drafts":self.db.list_collation_drafts(int(parts[2]),uid)})
+            if len(parts)==3 and parts[:2]==["api","collation-drafts"]:
+                uid=int(parse_qs(p.query).get("user_id",[0])[0]); return self._json(200,{"ok":True,"draft":self.db.get_collation_draft(int(parts[2]),uid)})
             self._json(404,{"ok":False,"error":"接口不存在"})
         except (DomainError,ValueError) as exc: self._json(400,{"ok":False,"error":str(exc)})
     def do_POST(self):
@@ -44,6 +48,15 @@ class Handler(BaseHTTPRequestHandler):
             if len(parts)==4 and parts[:2]==["api","variants"] and parts[3]=="revisions": return self._json(200,{"ok":True,"revision":self.db.update_variant(int(parts[2]),str(b.get("proposed_text","")),str(b.get("reason","")),int(b.get("user_id",0)),int(b.get("expected_revision",0)))})
             if path=="/api/notes": return self._json(201,{"ok":True,"id":self.db.add_note(int(b.get("variant_id",0)),str(b.get("body","")),int(b.get("user_id",0)))})
             if len(parts)==4 and parts[:2]==["api","passages"] and parts[3]=="lock": self.db.lock_passage(int(parts[2]),int(b.get("user_id",0)),str(b.get("reason",""))); return self._json(200,{"ok":True})
+            if len(parts)==4 and parts[:2]==["api","passages"] and parts[3]=="unlock": self.db.unlock_passage(int(parts[2]),int(b.get("user_id",0)),str(b.get("reason",""))); return self._json(200,{"ok":True})
+            if len(parts)==4 and parts[:2]==["api","works"] and parts[3]=="owner": self.db.change_work_owner(int(parts[2]),int(b.get("new_owner_id",0)),int(b.get("user_id",0))); return self._json(200,{"ok":True})
+            if len(parts)==5 and parts[:2]==["api","works"] and parts[3]=="access" and parts[4]=="revoke": self.db.revoke_work_access(int(parts[2]),int(b.get("user_id",0)),int(b.get("granted_by",0))); return self._json(200,{"ok":True})
+            if len(parts)==5 and parts[:2]==["api","witnesses"] and parts[3]=="editors" and parts[4]=="revoke": self.db.revoke_witness_editor(int(parts[2]),int(b.get("user_id",0)),int(b.get("granted_by",0))); return self._json(200,{"ok":True})
+            if len(parts)==4 and parts[:2]==["api","works"] and parts[3]=="collation-drafts": return self._json(201,{"ok":True,"id":self.db.create_collation_draft(int(parts[2]),str(b.get("label","")),b.get("cutoffs"),int(b.get("user_id",0)))})
+            if len(parts)==6 and parts[:2]==["api","collation-drafts"] and parts[3]=="passages" and parts[5]=="retry": return self._json(200,self.db.retry_draft_passage(int(parts[2]),int(parts[4]),int(b.get("user_id",0))))
+            if len(parts)==6 and parts[:2]==["api","collation-drafts"] and parts[3]=="passages" and parts[5]=="cutoff": return self._json(200,self.db.update_draft_passage_cutoff(int(parts[2]),int(parts[4]),int(b.get("cutoff_revision",0)),int(b.get("user_id",0))))
+            if len(parts)==6 and parts[:2]==["api","collation-drafts"] and parts[3]=="passages" and parts[5]=="confirm": return self._json(200,self.db.confirm_draft_passage(int(parts[2]),int(parts[4]),int(b.get("user_id",0)),int(b.get("expected_version",0)),b.get("content")))
+            if len(parts)==4 and parts[:2]==["api","collation-drafts"] and parts[3]=="publish": return self._json(200,self.db.publish_draft(int(parts[2]),int(b.get("user_id",0))))
             self._json(404,{"ok":False,"error":"接口不存在"})
         except (DomainError,ValueError) as exc: self._json(400,{"ok":False,"error":str(exc)})
 def main():

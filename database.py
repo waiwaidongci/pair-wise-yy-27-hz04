@@ -144,6 +144,31 @@ class CollationDB:
               reason TEXT NOT NULL DEFAULT '',
               locked_at TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS collation_drafts (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              work_id INTEGER NOT NULL REFERENCES works(id) ON DELETE CASCADE,
+              label TEXT NOT NULL DEFAULT '',
+              status TEXT NOT NULL DEFAULT 'draft' CHECK(status IN ('draft','invalid','published')),
+              created_by INTEGER NOT NULL REFERENCES users(id),
+              created_at TEXT NOT NULL,
+              published_by INTEGER REFERENCES users(id),
+              published_at TEXT
+            );
+            CREATE TABLE IF NOT EXISTS collation_draft_passages (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              draft_id INTEGER NOT NULL REFERENCES collation_drafts(id) ON DELETE CASCADE,
+              passage_id INTEGER NOT NULL REFERENCES passages(id) ON DELETE CASCADE,
+              cutoff_revision INTEGER NOT NULL,
+              status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending','done','failed')),
+              content_json TEXT,
+              fail_reason TEXT NOT NULL DEFAULT '',
+              version INTEGER NOT NULL DEFAULT 0,
+              confirmed_by INTEGER REFERENCES users(id),
+              confirmed_at TEXT,
+              updated_by INTEGER REFERENCES users(id),
+              updated_at TEXT NOT NULL,
+              UNIQUE(draft_id,passage_id)
+            );
             """
         )
         self.conn.commit()
@@ -378,6 +403,55 @@ class CollationDB:
                 "INSERT OR REPLACE INTO passage_locks(passage_id,locked_by,reason,locked_at) VALUES(?,?,?,?)",
                 (passage_id, user_id, reason.strip(), datetime.now().isoformat()),
             )
+            self._invalidate_open_drafts(passage["work_id"])
+
+    def unlock_passage(self, passage_id: int, user_id: int, reason: str = "") -> None:
+        passage = self.conn.execute("SELECT * FROM passages WHERE id=?", (passage_id,)).fetchone()
+        if not passage:
+            raise DomainError("段落不存在")
+        self._require_owner(passage["work_id"], user_id)
+        with self.transaction():
+            self.conn.execute("UPDATE passages SET status='open',updated_by=?,updated_at=? WHERE id=?", (user_id, datetime.now().isoformat(), passage_id))
+            self.conn.execute("DELETE FROM passage_locks WHERE passage_id=?", (passage_id,))
+            self._invalidate_open_drafts(passage["work_id"])
+
+    def _invalidate_open_drafts(self, work_id: int) -> None:
+        """作废该作品下所有未发布的候选稿；已发布版本保留不动。"""
+        self.conn.execute(
+            "UPDATE collation_drafts SET status='invalid' WHERE work_id=? AND status='draft'",
+            (work_id,),
+        )
+
+    def change_work_owner(self, work_id: int, new_owner_id: int, user_id: int) -> None:
+        work = self.conn.execute("SELECT * FROM works WHERE id=?", (work_id,)).fetchone()
+        if not work:
+            raise DomainError("作品不存在")
+        self._require_owner(work_id, user_id)
+        new_owner = self.conn.execute("SELECT * FROM users WHERE id=?", (new_owner_id,)).fetchone()
+        if not new_owner or new_owner["role"] != "owner":
+            raise DomainError("新负责人不存在或角色不符")
+        with self.transaction():
+            self.conn.execute("UPDATE works SET owner_id=? WHERE id=?", (new_owner_id, work_id))
+            self._invalidate_open_drafts(work_id)
+
+    def revoke_work_access(self, work_id: int, user_id: int, granted_by: int) -> None:
+        self._require_owner(work_id, granted_by)
+        if not self.conn.execute("SELECT 1 FROM users WHERE id=?", (user_id,)).fetchone():
+            raise DomainError("用户不存在")
+        with self.transaction():
+            self.conn.execute("DELETE FROM work_access WHERE work_id=? AND user_id=?", (work_id, user_id))
+            self._invalidate_open_drafts(work_id)
+
+    def revoke_witness_editor(self, witness_id: int, user_id: int, granted_by: int) -> None:
+        witness = self.conn.execute("SELECT work_id FROM witnesses WHERE id=?", (witness_id,)).fetchone()
+        if not witness:
+            raise DomainError("版本不存在")
+        self._require_owner(witness["work_id"], granted_by)
+        if not self.conn.execute("SELECT 1 FROM users WHERE id=?", (user_id,)).fetchone():
+            raise DomainError("用户不存在")
+        with self.transaction():
+            self.conn.execute("DELETE FROM witness_editors WHERE witness_id=? AND user_id=?", (witness_id, user_id))
+            self._invalidate_open_drafts(witness["work_id"])
 
     def get_snapshot(self, passage_id: int, revision_no: int, user_id: int) -> dict:
         passage = self.conn.execute("SELECT work_id FROM passages WHERE id=?", (passage_id,)).fetchone()
@@ -414,10 +488,278 @@ class CollationDB:
             passages.append({**dict(passage), "alignments": alignments, "variants": variants})
         return {"work": dict(work), "witnesses": witnesses, "passages": passages, "gap_count": gaps}
 
+    # ---- 合校发布：可恢复的合校稿 ----
+
+    def _can_confirm_draft(self, work_id: int, user_id: int) -> bool:
+        owner = self.conn.execute("SELECT 1 FROM works WHERE id=? AND owner_id=?", (work_id, user_id)).fetchone()
+        if owner:
+            return True
+        editor = self.conn.execute(
+            "SELECT 1 FROM witnesses w JOIN witness_editors e ON e.witness_id=w.id "
+            "WHERE w.work_id=? AND e.user_id=? LIMIT 1", (work_id, user_id),
+        ).fetchone()
+        return bool(editor)
+
+    def create_collation_draft(self, work_id: int, label: str, cutoffs: dict | None, user_id: int) -> int:
+        work = self.conn.execute("SELECT * FROM works WHERE id=?", (work_id,)).fetchone()
+        if not work:
+            raise DomainError("作品不存在")
+        self._require_owner(work_id, user_id)
+        label = label.strip() or "合校稿"
+        cutoffs = cutoffs or {}
+        if not isinstance(cutoffs, dict):
+            raise DomainError("截止修订必须是段落号到修订号的映射")
+        passages = [dict(r) for r in self.conn.execute("SELECT * FROM passages WHERE work_id=? ORDER BY id", (work_id,))]
+        if not passages:
+            raise DomainError("作品还没有段落")
+        # 归一化截止修订映射，并校验段落归属
+        cutoff_map: dict[int, int] = {}
+        for raw_pid, raw_rev in cutoffs.items():
+            pid = int(raw_pid)
+            if not any(p["id"] == pid for p in passages):
+                raise DomainError(f"段落 {pid} 不属于该作品")
+            rev = int(raw_rev)
+            if rev < 0:
+                raise DomainError(f"段落 {pid} 的截止修订不能为负")
+            cutoff_map[pid] = rev
+        now = datetime.now().isoformat()
+        with self.transaction():
+            cur = self.conn.execute(
+                "INSERT INTO collation_drafts(work_id,label,status,created_by,created_at) VALUES(?,?, 'draft',?,?)",
+                (work_id, label, user_id, now),
+            )
+            draft_id = int(cur.lastrowid)
+            for p in passages:
+                rev = cutoff_map.get(p["id"], int(p["revision"]))
+                self.conn.execute(
+                    "INSERT INTO collation_draft_passages(draft_id,passage_id,cutoff_revision,status,version,updated_at) "
+                    "VALUES(?,?,?, 'pending',0,?)",
+                    (draft_id, p["id"], rev, now),
+                )
+        self._generate_draft(draft_id)
+        return draft_id
+
+    def _assemble_passage_at_revision(self, passage_id: int, cutoff_revision: int) -> dict:
+        passage = self.conn.execute("SELECT * FROM passages WHERE id=?", (passage_id,)).fetchone()
+        if not passage:
+            raise DomainError("段落不存在")
+        if cutoff_revision > int(passage["revision"]):
+            raise DomainError(f"截止修订 {cutoff_revision} 晚于当前修订 {passage['revision']}")
+        alignments_sql = (
+            "SELECT a.*,w.siglum,w.kind FROM alignments a JOIN witnesses w ON w.id=a.witness_id "
+            "WHERE a.passage_id=? ORDER BY a.sort_order"
+        )
+        if cutoff_revision == 0:
+            # 尚无修订：取当前段落与对齐，异文为空
+            return {
+                "passage": dict(passage),
+                "alignments": [dict(a) for a in self.conn.execute(alignments_sql, (passage_id,))],
+                "variants": [],
+            }
+        if not self.conn.execute("SELECT 1 FROM revisions WHERE passage_id=? AND revision_no=?", (passage_id, cutoff_revision)).fetchone():
+            raise DomainError(f"截止修订 {cutoff_revision} 不存在")
+        # 回放截止修订（含）之前的所有修订，还原该时点的段落状态
+        variants: dict[int, dict] = {}
+        alignments: list[dict] = []
+        passage_state: dict | None = None
+        for r in self.conn.execute(
+            "SELECT * FROM revisions WHERE passage_id=? AND revision_no<=? ORDER BY revision_no",
+            (passage_id, cutoff_revision),
+        ).fetchall():
+            snap = json.loads(r["snapshot_json"])
+            variants[int(snap["variant"]["id"])] = snap["variant"]
+            alignments = snap["alignments"]
+            passage_state = snap["passage"]
+        variant_list = []
+        for v in variants.values():
+            v = dict(v)
+            v["notes"] = [dict(n) for n in self.conn.execute(
+                "SELECT * FROM notes WHERE variant_id=? ORDER BY id", (v["id"],),
+            )]
+            variant_list.append(v)
+        return {"passage": passage_state, "alignments": alignments, "variants": variant_list}
+
+    def _generate_draft(self, draft_id: int) -> None:
+        """逐段生成合校内容；已完成段落不重做，失败段落标记 failed 等待重试。"""
+        rows = self.conn.execute(
+            "SELECT * FROM collation_draft_passages WHERE draft_id=? AND status!='done' ORDER BY id",
+            (draft_id,),
+        ).fetchall()
+        now = datetime.now().isoformat()
+        for row in rows:
+            try:
+                content = self._assemble_passage_at_revision(row["passage_id"], row["cutoff_revision"])
+                content_json = json.dumps(content, ensure_ascii=False)
+                with self.transaction():
+                    self.conn.execute(
+                        "UPDATE collation_draft_passages SET status='done',content_json=?,fail_reason='',updated_at=? WHERE id=?",
+                        (content_json, now, row["id"]),
+                    )
+            except DomainError as exc:
+                with self.transaction():
+                    self.conn.execute(
+                        "UPDATE collation_draft_passages SET status='failed',fail_reason=?,updated_at=? WHERE id=?",
+                        (str(exc), now, row["id"]),
+                    )
+
+    def retry_draft_passage(self, draft_id: int, passage_id: int, user_id: int) -> dict:
+        draft = self.conn.execute("SELECT * FROM collation_drafts WHERE id=?", (draft_id,)).fetchone()
+        if not draft:
+            raise DomainError("合校稿不存在")
+        if draft["status"] == "published":
+            raise DomainError("已发布版本不能修改")
+        if draft["status"] == "invalid":
+            raise DomainError("合校稿已作废，请重新创建")
+        if not self.can_view_work(draft["work_id"], user_id):
+            raise DomainError("无权操作该合校稿")
+        row = self.conn.execute(
+            "SELECT * FROM collation_draft_passages WHERE draft_id=? AND passage_id=?",
+            (draft_id, passage_id),
+        ).fetchone()
+        if not row:
+            raise DomainError("段落不在合校稿中")
+        if row["status"] == "done":
+            raise DomainError("段落已完成，无需重试")
+        now = datetime.now().isoformat()
+        try:
+            content = self._assemble_passage_at_revision(passage_id, row["cutoff_revision"])
+        except DomainError as exc:
+            with self.transaction():
+                self.conn.execute(
+                    "UPDATE collation_draft_passages SET status='failed',fail_reason=?,updated_at=? WHERE id=?",
+                    (str(exc), now, row["id"]),
+                )
+            raise
+        with self.transaction():
+            self.conn.execute(
+                "UPDATE collation_draft_passages SET status='done',content_json=?,fail_reason='',updated_at=? WHERE id=?",
+                (json.dumps(content, ensure_ascii=False), now, row["id"]),
+            )
+        return {"ok": True, "status": "done"}
+
+    def update_draft_passage_cutoff(self, draft_id: int, passage_id: int, cutoff_revision: int, user_id: int) -> dict:
+        draft = self.conn.execute("SELECT * FROM collation_drafts WHERE id=?", (draft_id,)).fetchone()
+        if not draft:
+            raise DomainError("合校稿不存在")
+        if draft["status"] == "published":
+            raise DomainError("已发布版本不能修改")
+        self._require_owner(draft["work_id"], user_id)
+        row = self.conn.execute(
+            "SELECT * FROM collation_draft_passages WHERE draft_id=? AND passage_id=?",
+            (draft_id, passage_id),
+        ).fetchone()
+        if not row:
+            raise DomainError("段落不在合校稿中")
+        cutoff_revision = int(cutoff_revision)
+        if cutoff_revision < 0:
+            raise DomainError("截止修订不能为负")
+        now = datetime.now().isoformat()
+        with self.transaction():
+            self.conn.execute(
+                "UPDATE collation_draft_passages SET cutoff_revision=?,status='pending',content_json=NULL,"
+                "fail_reason='',version=0,confirmed_by=NULL,confirmed_at=NULL,updated_at=? WHERE id=?",
+                (cutoff_revision, now, row["id"]),
+            )
+        self._generate_draft(draft_id)
+        return {"ok": True}
+
+    def confirm_draft_passage(self, draft_id: int, passage_id: int, user_id: int,
+                              expected_version: int, content: dict | None = None) -> dict:
+        """编辑提交段落：先到者写入，晚到者凭版本冲突重新确认。"""
+        draft = self.conn.execute("SELECT * FROM collation_drafts WHERE id=?", (draft_id,)).fetchone()
+        if not draft:
+            raise DomainError("合校稿不存在")
+        if draft["status"] == "published":
+            raise DomainError("已发布版本不能修改")
+        if draft["status"] == "invalid":
+            raise DomainError("合校稿已作废，不能提交")
+        if not self._can_confirm_draft(draft["work_id"], user_id):
+            raise DomainError("无权提交该段落")
+        row = self.conn.execute(
+            "SELECT * FROM collation_draft_passages WHERE draft_id=? AND passage_id=?",
+            (draft_id, passage_id),
+        ).fetchone()
+        if not row:
+            raise DomainError("段落不在合校稿中")
+        if row["status"] != "done":
+            raise DomainError("段落尚未生成，不能确认")
+        content_json = None
+        if content is not None:
+            if not isinstance(content, dict):
+                raise DomainError("提交内容必须是对象")
+            content_json = json.dumps(content, ensure_ascii=False)
+        now = datetime.now().isoformat()
+        with self.transaction():
+            if content_json is not None:
+                cur = self.conn.execute(
+                    "UPDATE collation_draft_passages SET version=version+1,content_json=?,confirmed_by=?,"
+                    "confirmed_at=?,updated_by=?,updated_at=? WHERE draft_id=? AND passage_id=? AND version=?",
+                    (content_json, user_id, now, user_id, now, draft_id, passage_id, expected_version),
+                )
+            else:
+                cur = self.conn.execute(
+                    "UPDATE collation_draft_passages SET version=version+1,confirmed_by=?,"
+                    "confirmed_at=?,updated_by=?,updated_at=? WHERE draft_id=? AND passage_id=? AND version=?",
+                    (user_id, now, user_id, now, draft_id, passage_id, expected_version),
+                )
+            if cur.rowcount == 0:
+                raise DomainError("版本冲突：段落已被其他编辑提交，请重新确认")
+        new_row = self.conn.execute(
+            "SELECT version FROM collation_draft_passages WHERE draft_id=? AND passage_id=?",
+            (draft_id, passage_id),
+        ).fetchone()
+        return {"ok": True, "version": int(new_row["version"])}
+
+    def publish_draft(self, draft_id: int, user_id: int) -> dict:
+        draft = self.conn.execute("SELECT * FROM collation_drafts WHERE id=?", (draft_id,)).fetchone()
+        if not draft:
+            raise DomainError("合校稿不存在")
+        if draft["status"] != "draft":
+            raise DomainError("只有候选稿可以发布")
+        self._require_owner(draft["work_id"], user_id)
+        pending = int(self.conn.execute(
+            "SELECT COUNT(*) FROM collation_draft_passages WHERE draft_id=? AND status!='done'",
+            (draft_id,),
+        ).fetchone()[0])
+        if pending:
+            raise DomainError(f"仍有 {pending} 个段落未完成，不能发布")
+        now = datetime.now().isoformat()
+        with self.transaction():
+            self.conn.execute(
+                "UPDATE collation_drafts SET status='published',published_by=?,published_at=? WHERE id=?",
+                (user_id, now, draft_id),
+            )
+        return {"ok": True, "status": "published"}
+
+    def get_collation_draft(self, draft_id: int, user_id: int) -> dict:
+        draft = self.conn.execute("SELECT * FROM collation_drafts WHERE id=?", (draft_id,)).fetchone()
+        if not draft:
+            raise DomainError("合校稿不存在")
+        if not self.can_view_work(draft["work_id"], user_id):
+            raise DomainError("无权查看该合校稿")
+        passages = [dict(r) for r in self.conn.execute(
+            "SELECT * FROM collation_draft_passages WHERE draft_id=? ORDER BY id", (draft_id,),
+        )]
+        result = dict(draft)
+        result["passages"] = passages
+        return result
+
+    def list_collation_drafts(self, work_id: int, user_id: int) -> list[dict]:
+        work = self.conn.execute("SELECT * FROM works WHERE id=?", (work_id,)).fetchone()
+        if not work:
+            raise DomainError("作品不存在")
+        if not self.can_view_work(work_id, user_id):
+            raise DomainError("无权查看该作品的合校稿")
+        return [dict(r) for r in self.conn.execute(
+            "SELECT * FROM collation_drafts WHERE work_id=? ORDER BY id DESC", (work_id,),
+        ).fetchall()]
+
     def snapshot(self) -> dict:
         return {
             "users": [dict(r) for r in self.conn.execute("SELECT id,name,role FROM users ORDER BY id")],
             "works": [dict(r) for r in self.conn.execute("SELECT * FROM works ORDER BY id")],
             "witnesses": [dict(r) for r in self.conn.execute("SELECT * FROM witnesses ORDER BY id")],
             "passages": [dict(r) for r in self.conn.execute("SELECT * FROM passages ORDER BY id")],
+            "collation_drafts": [dict(r) for r in self.conn.execute("SELECT * FROM collation_drafts ORDER BY id")],
+            "collation_draft_passages": [dict(r) for r in self.conn.execute("SELECT * FROM collation_draft_passages ORDER BY id")],
         }
